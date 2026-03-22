@@ -231,6 +231,8 @@ def td3(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         loss_q.backward()
         q_optimizer.step()
 
+        logger.store(CriticGradNorm=critic_gn)
+
         # Record things
         logger.store(LossQ=loss_q.item(), **loss_info)
 
@@ -247,6 +249,8 @@ def td3(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
             loss_pi = compute_loss_pi(data)
             loss_pi.backward()
             pi_optimizer.step()
+
+            logger.store(ActorGradNorm=actor_gn)
 
             # Unfreeze Q-networks so you can optimize it at next DDPG step.
             for p in q_params:
