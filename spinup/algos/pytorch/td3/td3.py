@@ -1,12 +1,37 @@
+
 from copy import deepcopy
 import itertools
 import numpy as np
 import torch
 from torch.optim import Adam
-import gymnasium as gym
+import gym
 import time
 import spinup.algos.pytorch.td3.core as core
 from spinup.utils.logx import EpochLogger
+import os
+
+def save_checkpoint(ac, pi_optimizer, q_optimizer, epoch, path):
+    torch.save({
+        'actor': ac.pi.state_dict(),
+        'q1': ac.q1.state_dict(),
+        'q2': ac.q2.state_dict(),
+        'pi_opt': pi_optimizer.state_dict(),
+        'q_opt': q_optimizer.state_dict(),
+        'epoch': epoch
+    }, path)
+
+
+def load_checkpoint(ac, pi_optimizer, q_optimizer, path):
+    checkpoint = torch.load(path)
+
+    ac.pi.load_state_dict(checkpoint['actor'])
+    ac.q1.load_state_dict(checkpoint['q1'])
+    ac.q2.load_state_dict(checkpoint['q2'])
+
+    pi_optimizer.load_state_dict(checkpoint['pi_opt'])
+    q_optimizer.load_state_dict(checkpoint['q_opt'])
+
+    return checkpoint['epoch']
 
 
 class ReplayBuffer:
@@ -221,6 +246,19 @@ def td3(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
     pi_optimizer = Adam(ac.pi.parameters(), lr=pi_lr)
     q_optimizer = Adam(q_params, lr=q_lr)
 
+    
+    #Checkpoint logic
+    checkpoint_dir = "checkpoints"
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    
+    checkpoint_path = os.path.join(checkpoint_dir, logger_kwargs['exp_name'] + ".pt")
+    
+    start_epoch = 0
+    
+    if os.path.exists(checkpoint_path):
+        print(f"[CHECKPOINT] Loading {checkpoint_path}")
+        start_epoch = load_checkpoint(ac, pi_optimizer, q_optimizer, checkpoint_path)
+
     # Set up model saving
     logger.setup_pytorch_saver(ac)
 
@@ -229,6 +267,14 @@ def td3(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         q_optimizer.zero_grad()
         loss_q, loss_info = compute_loss_q(data)
         loss_q.backward()
+        
+        #Added
+        critic_gn = 0
+        for p in q_params:
+            if p.grad is not None:
+                critic_gn += p.grad.data.norm(2).item() ** 2
+        critic_gn = critic_gn ** 0.5
+        
         q_optimizer.step()
 
         logger.store(CriticGradNorm=critic_gn)
@@ -248,6 +294,13 @@ def td3(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
             pi_optimizer.zero_grad()
             loss_pi = compute_loss_pi(data)
             loss_pi.backward()
+
+            #Added
+            actor_gn = 0
+            for p in ac.pi.parameters():
+                if p.grad is not None:
+                    actor_gn += p.grad.data.norm(2).item() ** 2
+            actor_gn = actor_gn ** 0.5
             pi_optimizer.step()
 
             logger.store(ActorGradNorm=actor_gn)
@@ -274,10 +327,10 @@ def td3(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
 
     def test_agent():
         for j in range(num_test_episodes):
-            o, d, ep_ret, ep_len = test_env.reset()[0], False, 0, 0
+            o, d, ep_ret, ep_len = test_env.reset(), False, 0, 0
             while not(d or (ep_len == max_ep_len)):
                 # Take deterministic actions at test time (noise_scale=0)
-                o, r, d, truncated, _ = test_env.step(get_action(o, 0))
+                o, r, d, _ = test_env.step(get_action(o, 0))
                 ep_ret += r
                 ep_len += 1
             logger.store(TestEpRet=ep_ret, TestEpLen=ep_len)
@@ -285,10 +338,11 @@ def td3(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
     # Prepare for interaction with environment
     total_steps = steps_per_epoch * epochs
     start_time = time.time()
-    o, ep_ret, ep_len = env.reset()[0], 0, 0
+    o, ep_ret, ep_len = env.reset(), 0, 0
 
     # Main loop: collect experience in env and update/log each epoch
-    for t in range(total_steps):
+    for t in range(start_steps,total_steps):
+        start_step = start_epoch * steps_per_epoch
         
         # Until start_steps have elapsed, randomly sample actions
         # from a uniform distribution for better exploration. Afterwards, 
@@ -299,7 +353,7 @@ def td3(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
             a = env.action_space.sample()
 
         # Step the env
-        o2, r, d, truncated, _ = env.step(a)
+        o2, r, d, _ = env.step(a)
         ep_ret += r
         ep_len += 1
 
@@ -318,7 +372,7 @@ def td3(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         # End of trajectory handling
         if d or (ep_len == max_ep_len):
             logger.store(EpRet=ep_ret, EpLen=ep_len)
-            o, ep_ret, ep_len = env.reset()[0], 0, 0
+            o, ep_ret, ep_len = env.reset(), 0, 0
 
         # Update handling
         if t >= update_after and t % update_every == 0:
@@ -329,6 +383,10 @@ def td3(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         # End of epoch handling
         if (t+1) % steps_per_epoch == 0:
             epoch = (t+1) // steps_per_epoch
+
+            # Save checkpoint every 10 epochs
+        if epoch % 10 == 0:
+            save_checkpoint(ac, pi_optimizer, q_optimizer, epoch, checkpoint_path)
 
             # Save model
             if (epoch % save_freq == 0) or (epoch == epochs):
