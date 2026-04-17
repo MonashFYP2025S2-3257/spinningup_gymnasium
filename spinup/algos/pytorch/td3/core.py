@@ -20,12 +20,52 @@ def mlp(sizes, activation, output_activation=nn.Identity):
 def count_vars(module):
     return sum([np.prod(p.shape) for p in module.parameters()])
 
+class ResidualBlock(nn.Module):
+    """
+    A single layer that 'skips' over itself.
+    It calculates: Activation(Linear(x) + x)
+    """
+    def __init__(self, size, activation):
+        super().__init__()
+        self.linear = nn.Linear(size, size)
+        self.act = activation()
+
+    def forward(self, x):
+        # The 'skip': add the original input x back to the output of the layer
+        return self.act(self.linear(x) + x)
+    
+class SkipMLP(nn.Module):
+    """
+    An MLP that uses ResidualBlocks for its hidden layers.
+    """
+    def __init__(self, sizes, activation):
+        super().__init__()
+        self.input_layer = nn.Sequential(
+            nn.Linear(sizes[0], sizes[1]),
+            activation()
+        )
+        
+        self.res_blocks = nn.ModuleList([
+            ResidualBlock(sizes[1], activation) for _ in range(len(sizes) - 2)
+        ])
+
+        self.output_layer = nn.Linear(sizes[-2], sizes[-1])
+
+    def forward(self, x):
+        x = self.input_layer(x)
+        
+        for block in self.res_blocks:
+            x = block(x)
+            
+        # Step 3: Map to final output
+        return self.output_layer(x)
+
 class MLPActor(nn.Module):
 
     def __init__(self, obs_dim, act_dim, hidden_sizes, activation, act_limit):
         super().__init__()
         pi_sizes = [obs_dim] + list(hidden_sizes) + [act_dim]
-        self.pi = mlp(pi_sizes, activation, nn.Tanh)
+        self.pi = SkipMLP(pi_sizes, activation, nn.Tanh)
         self.act_limit = act_limit
 
     def forward(self, obs):
@@ -36,7 +76,7 @@ class MLPQFunction(nn.Module):
 
     def __init__(self, obs_dim, act_dim, hidden_sizes, activation):
         super().__init__()
-        self.q = mlp([obs_dim + act_dim] + list(hidden_sizes) + [1], activation)
+        self.q = SkipMLP([obs_dim + act_dim] + list(hidden_sizes) + [1], activation)
 
     def forward(self, obs, act):
         q = self.q(torch.cat([obs, act], dim=-1))
