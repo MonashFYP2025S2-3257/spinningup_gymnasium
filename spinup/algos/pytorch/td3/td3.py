@@ -1,44 +1,44 @@
-
 from copy import deepcopy
-import itertools
+import os
+import time
+from collections import defaultdict
+
 import numpy as np
 import torch
 from torch.optim import Adam
-import gym
-import time
+import gymnasium as gym
+
 import spinup.algos.pytorch.td3.core as core
 from spinup.utils.logx import EpochLogger
-import os
 
-def save_checkpoint(ac, pi_optimizer, q_optimizer, epoch, path):
+
+def save_checkpoint(ac, pi_optimizer, q_optimizer, epoch, path, gradient_history=None):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     torch.save({
-        'actor': ac.pi.state_dict(),
-        'q1': ac.q1.state_dict(),
-        'q2': ac.q2.state_dict(),
-        'pi_opt': pi_optimizer.state_dict(),
-        'q_opt': q_optimizer.state_dict(),
-        'epoch': epoch
+        "actor": ac.pi.state_dict(),
+        "q1": ac.q1.state_dict(),
+        "q2": ac.q2.state_dict(),
+        "pi_opt": pi_optimizer.state_dict(),
+        "q_opt": q_optimizer.state_dict(),
+        "epoch": epoch,
+        "gradient_history": gradient_history,
     }, path)
 
 
 def load_checkpoint(ac, pi_optimizer, q_optimizer, path):
-    checkpoint = torch.load(path)
-
-    ac.pi.load_state_dict(checkpoint['actor'])
-    ac.q1.load_state_dict(checkpoint['q1'])
-    ac.q2.load_state_dict(checkpoint['q2'])
-
-    pi_optimizer.load_state_dict(checkpoint['pi_opt'])
-    q_optimizer.load_state_dict(checkpoint['q_opt'])
-
-    return checkpoint['epoch']
+    checkpoint = torch.load(path, map_location="cpu")
+    ac.pi.load_state_dict(checkpoint["actor"])
+    ac.q1.load_state_dict(checkpoint["q1"])
+    ac.q2.load_state_dict(checkpoint["q2"])
+    pi_optimizer.load_state_dict(checkpoint["pi_opt"])
+    q_optimizer.load_state_dict(checkpoint["q_opt"])
+    return checkpoint["epoch"], checkpoint.get("gradient_history", None)
 
 
 class ReplayBuffer:
     """
     A simple FIFO experience replay buffer for TD3 agents.
     """
-
     def __init__(self, obs_dim, act_dim, size):
         self.obs_buf = np.zeros(core.combined_shape(size, obs_dim), dtype=np.float32)
         self.obs2_buf = np.zeros(core.combined_shape(size, obs_dim), dtype=np.float32)
@@ -53,124 +53,46 @@ class ReplayBuffer:
         self.act_buf[self.ptr] = act
         self.rew_buf[self.ptr] = rew
         self.done_buf[self.ptr] = done
-        self.ptr = (self.ptr+1) % self.max_size
-        self.size = min(self.size+1, self.max_size)
+        self.ptr = (self.ptr + 1) % self.max_size
+        self.size = min(self.size + 1, self.max_size)
 
     def sample_batch(self, batch_size=32):
         idxs = np.random.randint(0, self.size, size=batch_size)
-        batch = dict(obs=self.obs_buf[idxs],
-                     obs2=self.obs2_buf[idxs],
-                     act=self.act_buf[idxs],
-                     rew=self.rew_buf[idxs],
-                     done=self.done_buf[idxs])
-        return {k: torch.as_tensor(v, dtype=torch.float32) for k,v in batch.items()}
+        batch = dict(
+            obs=self.obs_buf[idxs],
+            obs2=self.obs2_buf[idxs],
+            act=self.act_buf[idxs],
+            rew=self.rew_buf[idxs],
+            done=self.done_buf[idxs],
+        )
+        return {k: torch.as_tensor(v, dtype=torch.float32) for k, v in batch.items()}
 
 
-
-def td3(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0, 
-        steps_per_epoch=4000, epochs=100, replay_size=int(1e6), gamma=0.99, 
-        polyak=0.995, pi_lr=1e-3, q_lr=1e-3, batch_size=100, start_steps=10000, 
-        update_after=1000, update_every=50, act_noise=0.1, target_noise=0.2, 
-        noise_clip=0.5, policy_delay=2, num_test_episodes=10, max_ep_len=1000, 
-        logger_kwargs=dict(), save_freq=1):
-    """
-    Twin Delayed Deep Deterministic Policy Gradient (TD3)
-
-
-    Args:
-        env_fn : A function which creates a copy of the environment.
-            The environment must satisfy the OpenAI Gym API.
-
-        actor_critic: The constructor method for a PyTorch Module with an ``act`` 
-            method, a ``pi`` module, a ``q1`` module, and a ``q2`` module.
-            The ``act`` method and ``pi`` module should accept batches of 
-            observations as inputs, and ``q1`` and ``q2`` should accept a batch 
-            of observations and a batch of actions as inputs. When called, 
-            these should return:
-
-            ===========  ================  ======================================
-            Call         Output Shape      Description
-            ===========  ================  ======================================
-            ``act``      (batch, act_dim)  | Numpy array of actions for each 
-                                           | observation.
-            ``pi``       (batch, act_dim)  | Tensor containing actions from policy
-                                           | given observations.
-            ``q1``       (batch,)          | Tensor containing one current estimate
-                                           | of Q* for the provided observations
-                                           | and actions. (Critical: make sure to
-                                           | flatten this!)
-            ``q2``       (batch,)          | Tensor containing the other current 
-                                           | estimate of Q* for the provided observations
-                                           | and actions. (Critical: make sure to
-                                           | flatten this!)
-            ===========  ================  ======================================
-
-        ac_kwargs (dict): Any kwargs appropriate for the ActorCritic object 
-            you provided to TD3.
-
-        seed (int): Seed for random number generators.
-
-        steps_per_epoch (int): Number of steps of interaction (state-action pairs) 
-            for the agent and the environment in each epoch.
-
-        epochs (int): Number of epochs to run and train agent.
-
-        replay_size (int): Maximum length of replay buffer.
-
-        gamma (float): Discount factor. (Always between 0 and 1.)
-
-        polyak (float): Interpolation factor in polyak averaging for target 
-            networks. Target networks are updated towards main networks 
-            according to:
-
-            .. math:: \\theta_{\\text{targ}} \\leftarrow 
-                \\rho \\theta_{\\text{targ}} + (1-\\rho) \\theta
-
-            where :math:`\\rho` is polyak. (Always between 0 and 1, usually 
-            close to 1.)
-
-        pi_lr (float): Learning rate for policy.
-
-        q_lr (float): Learning rate for Q-networks.
-
-        batch_size (int): Minibatch size for SGD.
-
-        start_steps (int): Number of steps for uniform-random action selection,
-            before running real policy. Helps exploration.
-
-        update_after (int): Number of env interactions to collect before
-            starting to do gradient descent updates. Ensures replay buffer
-            is full enough for useful updates.
-
-        update_every (int): Number of env interactions that should elapse
-            between gradient descent updates. Note: Regardless of how long 
-            you wait between updates, the ratio of env steps to gradient steps 
-            is locked to 1.
-
-        act_noise (float): Stddev for Gaussian exploration noise added to 
-            policy at training time. (At test time, no noise is added.)
-
-        target_noise (float): Stddev for smoothing noise added to target 
-            policy.
-
-        noise_clip (float): Limit for absolute value of target policy 
-            smoothing noise.
-
-        policy_delay (int): Policy will only be updated once every 
-            policy_delay times for each update of the Q-networks.
-
-        num_test_episodes (int): Number of episodes to test the deterministic
-            policy at the end of each epoch.
-
-        max_ep_len (int): Maximum length of trajectory / episode / rollout.
-
-        logger_kwargs (dict): Keyword args for EpochLogger.
-
-        save_freq (int): How often (in terms of gap between epochs) to save
-            the current policy and value function.
-
-    """
-
+def td3(
+    env_fn,
+    actor_critic=core.MLPActorCritic,
+    ac_kwargs=dict(),
+    seed=0,
+    steps_per_epoch=4000,
+    epochs=100,
+    replay_size=int(1e6),
+    gamma=0.99,
+    polyak=0.995,
+    pi_lr=1e-3,
+    q_lr=1e-3,
+    batch_size=100,
+    start_steps=10000,
+    update_after=1000,
+    update_every=50,
+    act_noise=0.1,
+    target_noise=0.2,
+    noise_clip=0.5,
+    policy_delay=2,
+    num_test_episodes=10,
+    max_ep_len=1000,
+    logger_kwargs=dict(),
+    save_freq=1,
+):
     logger = EpochLogger(**logger_kwargs)
     logger.save_config(locals())
 
@@ -180,143 +102,156 @@ def td3(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
     env, test_env = env_fn(), env_fn()
     obs_dim = env.observation_space.shape
     act_dim = env.action_space.shape[0]
-
-    # Action limit for clamping: critically, assumes all dimensions share the same bound!
     act_limit = env.action_space.high[0]
 
-    # Create actor-critic module and target networks
     ac = actor_critic(env.observation_space, env.action_space, **ac_kwargs)
     ac_targ = deepcopy(ac)
 
-    # Freeze target networks with respect to optimizers (only update via polyak averaging)
     for p in ac_targ.parameters():
         p.requires_grad = False
-        
-    # List of parameters for both Q-networks (save this for convenience)
-    q_params = itertools.chain(ac.q1.parameters(), ac.q2.parameters())
 
-    # Experience buffer
+    q_params = list(ac.q1.parameters()) + list(ac.q2.parameters())
     replay_buffer = ReplayBuffer(obs_dim=obs_dim, act_dim=act_dim, size=replay_size)
 
-    # Count variables (protip: try to get a feel for how different size networks behave!)
     var_counts = tuple(core.count_vars(module) for module in [ac.pi, ac.q1, ac.q2])
-    logger.log('\nNumber of parameters: \t pi: %d, \t q1: %d, \t q2: %d\n'%var_counts)
+    logger.log("\nNumber of parameters: \t pi: %d, \t q1: %d, \t q2: %d\n" % var_counts)
 
-    # Set up function for computing TD3 Q-losses
+    pi_optimizer = Adam(ac.pi.parameters(), lr=pi_lr)
+    q_optimizer = Adam(q_params, lr=q_lr)
+
+    # -------------------- checkpoint setup --------------------
+    exp_name = logger_kwargs.get("exp_name", "td3_run")
+    checkpoint_root = os.environ.get("CHECKPOINT_DIR", "checkpoints")
+    checkpoint_path = os.path.join(checkpoint_root, f"{exp_name}.pt")
+    os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
+
+    # -------------------- layerwise gradient history --------------------
+    gradient_history = {}
+    epoch_grad_buffer = defaultdict(list)
+
+    def get_layer_grad_norms(module, prefix):
+        grad_dict = {}
+        for name, p in module.named_parameters():
+            key = f"{prefix}.{name}"
+            if p.grad is not None:
+                grad_dict[key] = p.grad.data.norm(2).item()
+            else:
+                grad_dict[key] = np.nan
+        return grad_dict
+
+    def accumulate_gradients(grad_dict):
+        for k, v in grad_dict.items():
+            if not np.isnan(v):
+                epoch_grad_buffer[k].append(v)
+
+    def summarize_epoch_gradients():
+        summary = {}
+        for k, vals in epoch_grad_buffer.items():
+            summary[k] = float(np.mean(vals)) if len(vals) > 0 else np.nan
+        return summary
+
+    def reset_epoch_gradient_buffer():
+        epoch_grad_buffer.clear()
+
     def compute_loss_q(data):
-        o, a, r, o2, d = data['obs'], data['act'], data['rew'], data['obs2'], data['done']
+        o, a, r, o2, d = data["obs"], data["act"], data["rew"], data["obs2"], data["done"]
 
-        q1 = ac.q1(o,a)
-        q2 = ac.q2(o,a)
+        q1 = ac.q1(o, a)
+        q2 = ac.q2(o, a)
 
-        # Bellman backup for Q functions
         with torch.no_grad():
             pi_targ = ac_targ.pi(o2)
 
-            # Target policy smoothing
             epsilon = torch.randn_like(pi_targ) * target_noise
             epsilon = torch.clamp(epsilon, -noise_clip, noise_clip)
             a2 = pi_targ + epsilon
             a2 = torch.clamp(a2, -act_limit, act_limit)
 
-            # Target Q-values
             q1_pi_targ = ac_targ.q1(o2, a2)
             q2_pi_targ = ac_targ.q2(o2, a2)
             q_pi_targ = torch.min(q1_pi_targ, q2_pi_targ)
             backup = r + gamma * (1 - d) * q_pi_targ
 
-        # MSE loss against Bellman backup
-        loss_q1 = ((q1 - backup)**2).mean()
-        loss_q2 = ((q2 - backup)**2).mean()
+        loss_q1 = ((q1 - backup) ** 2).mean()
+        loss_q2 = ((q2 - backup) ** 2).mean()
         loss_q = loss_q1 + loss_q2
 
-        # Useful info for logging
-        loss_info = dict(Q1Vals=q1.detach().numpy(),
-                         Q2Vals=q2.detach().numpy())
-
+        loss_info = dict(
+            Q1Vals=q1.detach().cpu().numpy(),
+            Q2Vals=q2.detach().cpu().numpy(),
+        )
         return loss_q, loss_info
 
-    # Set up function for computing TD3 pi loss
     def compute_loss_pi(data):
-        o = data['obs']
+        o = data["obs"]
         q1_pi = ac.q1(o, ac.pi(o))
         return -q1_pi.mean()
 
-    # Set up optimizers for policy and q-function
-    pi_optimizer = Adam(ac.pi.parameters(), lr=pi_lr)
-    q_optimizer = Adam(q_params, lr=q_lr)
-
-    
-    #Checkpoint logic
-    checkpoint_dir = "checkpoints"
-    os.makedirs(checkpoint_dir, exist_ok=True)
-    
-    checkpoint_path = os.path.join(checkpoint_dir, logger_kwargs['exp_name'] + ".pt")
-    
     start_epoch = 0
-    
     if os.path.exists(checkpoint_path):
-        print(f"[CHECKPOINT] Loading {checkpoint_path}")
-        start_epoch = load_checkpoint(ac, pi_optimizer, q_optimizer, checkpoint_path)
+        print(f"[CHECKPOINT] Found {checkpoint_path}")
+        try:
+            start_epoch, loaded_history = load_checkpoint(ac, pi_optimizer, q_optimizer, checkpoint_path)
+            if loaded_history is not None:
+                gradient_history = loaded_history
+            print(f"[CHECKPOINT] Loaded successfully from epoch {start_epoch}")
+        except RuntimeError as e:
+            print(f"[CHECKPOINT] Incompatible checkpoint, starting fresh.\nReason: {e}")
+            start_epoch = 0
+            gradient_history = {}
+        except Exception as e:
+            print(f"[CHECKPOINT] Could not load checkpoint, starting fresh.\nReason: {e}")
+            start_epoch = 0
+            gradient_history = {}
 
-    # Set up model saving
     logger.setup_pytorch_saver(ac)
 
     def update(data, timer):
-        # First run one gradient descent step for Q1 and Q2
+        # -------- Critic update --------
         q_optimizer.zero_grad()
         loss_q, loss_info = compute_loss_q(data)
         loss_q.backward()
-        
-        #Added
-        critic_gn = 0
+
+        critic_gn = 0.0
         for p in q_params:
             if p.grad is not None:
                 critic_gn += p.grad.data.norm(2).item() ** 2
         critic_gn = critic_gn ** 0.5
-        
+
+        q1_grads = get_layer_grad_norms(ac.q1, "critic.qf0")
+        q2_grads = get_layer_grad_norms(ac.q2, "critic.qf1")
+        accumulate_gradients(q1_grads)
+        accumulate_gradients(q2_grads)
+
         q_optimizer.step()
+        logger.store(CriticGradNorm=critic_gn, LossQ=loss_q.item(), **loss_info)
 
-        logger.store(CriticGradNorm=critic_gn)
-
-        # Record things
-        logger.store(LossQ=loss_q.item(), **loss_info)
-
-        # Possibly update pi and target networks
+        # -------- Delayed actor update --------
         if timer % policy_delay == 0:
-
-            # Freeze Q-networks so you don't waste computational effort 
-            # computing gradients for them during the policy learning step.
             for p in q_params:
                 p.requires_grad = False
 
-            # Next run one gradient descent step for pi.
             pi_optimizer.zero_grad()
             loss_pi = compute_loss_pi(data)
             loss_pi.backward()
 
-            #Added
-            actor_gn = 0
+            actor_gn = 0.0
             for p in ac.pi.parameters():
                 if p.grad is not None:
                     actor_gn += p.grad.data.norm(2).item() ** 2
             actor_gn = actor_gn ** 0.5
+
+            pi_grads = get_layer_grad_norms(ac.pi, "actor")
+            accumulate_gradients(pi_grads)
+
             pi_optimizer.step()
+            logger.store(ActorGradNorm=actor_gn, LossPi=loss_pi.item())
 
-            logger.store(ActorGradNorm=actor_gn)
-
-            # Unfreeze Q-networks so you can optimize it at next DDPG step.
             for p in q_params:
                 p.requires_grad = True
 
-            # Record things
-            logger.store(LossPi=loss_pi.item())
-
-            # Finally, update target networks by polyak averaging.
             with torch.no_grad():
                 for p, p_targ in zip(ac.parameters(), ac_targ.parameters()):
-                    # NB: We use an in-place operations "mul_", "add_" to update target
-                    # params, as opposed to "mul" and "add", which would make new tensors.
                     p_targ.data.mul_(polyak)
                     p_targ.data.add_((1 - polyak) * p.data)
 
@@ -326,105 +261,82 @@ def td3(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         return np.clip(a, -act_limit, act_limit)
 
     def test_agent():
-        for j in range(num_test_episodes):
-            o, d, ep_ret, ep_len = test_env.reset(), False, 0, 0
-            while not(d or (ep_len == max_ep_len)):
-                # Take deterministic actions at test time (noise_scale=0)
-                o, r, d, _ = test_env.step(get_action(o, 0))
+        for _ in range(num_test_episodes):
+            o, _ = test_env.reset()
+            d, ep_ret, ep_len = False, 0, 0
+            while not (d or (ep_len == max_ep_len)):
+                o, r, terminated, truncated, _ = test_env.step(get_action(o, 0))
+                d = terminated or truncated
                 ep_ret += r
                 ep_len += 1
             logger.store(TestEpRet=ep_ret, TestEpLen=ep_len)
 
-    # Prepare for interaction with environment
     total_steps = steps_per_epoch * epochs
     start_time = time.time()
-    o, ep_ret, ep_len = env.reset(), 0, 0
 
-    # Main loop: collect experience in env and update/log each epoch
-    for t in range(start_steps,total_steps):
-        start_step = start_epoch * steps_per_epoch
-        
-        # Until start_steps have elapsed, randomly sample actions
-        # from a uniform distribution for better exploration. Afterwards, 
-        # use the learned policy (with some noise, via act_noise). 
+    o, _ = env.reset()
+    ep_ret, ep_len = 0, 0
+    reset_epoch_gradient_buffer()
+
+    for t in range(total_steps):
         if t > start_steps:
             a = get_action(o, act_noise)
         else:
             a = env.action_space.sample()
 
-        # Step the env
-        o2, r, d, _ = env.step(a)
+        o2, r, terminated, truncated, _ = env.step(a)
+        d = terminated or truncated
         ep_ret += r
         ep_len += 1
 
-        # Ignore the "done" signal if it comes from hitting the time
-        # horizon (that is, when it's an artificial terminal signal
-        # that isn't based on the agent's state)
-        d = False if ep_len==max_ep_len else d
-
-        # Store experience to replay buffer
+        d = False if ep_len == max_ep_len else d
         replay_buffer.store(o, a, r, o2, d)
-
-        # Super critical, easy to overlook step: make sure to update 
-        # most recent observation!
         o = o2
 
-        # End of trajectory handling
         if d or (ep_len == max_ep_len):
             logger.store(EpRet=ep_ret, EpLen=ep_len)
-            o, ep_ret, ep_len = env.reset(), 0, 0
+            o, _ = env.reset()
+            ep_ret, ep_len = 0, 0
 
-        # Update handling
         if t >= update_after and t % update_every == 0:
             for j in range(update_every):
                 batch = replay_buffer.sample_batch(batch_size)
                 update(data=batch, timer=j)
 
-        # End of epoch handling
-        if (t+1) % steps_per_epoch == 0:
-            epoch = (t+1) // steps_per_epoch
+        if (t + 1) % steps_per_epoch == 0:
+            epoch = (t + 1) // steps_per_epoch
 
-            # Save checkpoint every 10 epochs
-        if epoch % 10 == 0:
-            save_checkpoint(ac, pi_optimizer, q_optimizer, epoch, checkpoint_path)
+            gradient_history[epoch] = summarize_epoch_gradients()
+            reset_epoch_gradient_buffer()
 
-            # Save model
+            if epoch % 10 == 0:
+                save_checkpoint(
+                    ac,
+                    pi_optimizer,
+                    q_optimizer,
+                    epoch,
+                    checkpoint_path,
+                    gradient_history=gradient_history,
+                )
+
             if (epoch % save_freq == 0) or (epoch == epochs):
-                logger.save_state({'env': env}, None)
+                logger.save_state({"env": env, "gradient_history": gradient_history}, None)
 
-            # Test the performance of the deterministic version of the agent.
             test_agent()
 
-            # Log info about epoch
-            logger.log_tabular('Epoch', epoch)
-            logger.log_tabular('EpRet', with_min_and_max=True)
-            logger.log_tabular('TestEpRet', with_min_and_max=True)
-            logger.log_tabular('EpLen', average_only=True)
-            logger.log_tabular('TestEpLen', average_only=True)
-            logger.log_tabular('TotalEnvInteracts', t)
-            logger.log_tabular('Q1Vals', with_min_and_max=True)
-            logger.log_tabular('Q2Vals', with_min_and_max=True)
-            logger.log_tabular('LossPi', average_only=True)
-            logger.log_tabular('LossQ', average_only=True)
-            logger.log_tabular('Time', time.time()-start_time)
+            logger.log_tabular("Epoch", epoch)
+            logger.log_tabular("EpRet", with_min_and_max=True)
+            logger.log_tabular("TestEpRet", with_min_and_max=True)
+            logger.log_tabular("EpLen", average_only=True)
+            logger.log_tabular("TestEpLen", average_only=True)
+            logger.log_tabular("TotalEnvInteracts", t)
+            logger.log_tabular("Q1Vals", with_min_and_max=True)
+            logger.log_tabular("Q2Vals", with_min_and_max=True)
+            logger.log_tabular("LossPi", average_only=True)
+            logger.log_tabular("LossQ", average_only=True)
+            logger.log_tabular("Time", time.time() - start_time)
+            logger.log_tabular("ActorGradNorm", average_only=True)
+            logger.log_tabular("CriticGradNorm", average_only=True)
             logger.dump_tabular()
 
-if __name__ == '__main__':
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--env', type=str, default='HalfCheetah-v2')
-    parser.add_argument('--hid', type=int, default=256)
-    parser.add_argument('--l', type=int, default=2)
-    parser.add_argument('--gamma', type=float, default=0.99)
-    parser.add_argument('--seed', '-s', type=int, default=0)
-    parser.add_argument('--epochs', type=int, default=50)
-    parser.add_argument('--exp_name', type=str, default='td3')
-    args = parser.parse_args()
-
-    from spinup.utils.run_utils import setup_logger_kwargs
-    logger_kwargs = setup_logger_kwargs(args.exp_name, args.seed)
-
-    td3(lambda : gym.make(args.env), actor_critic=core.MLPActorCritic,
-        ac_kwargs=dict(hidden_sizes=[args.hid]*args.l), 
-        gamma=args.gamma, seed=args.seed, epochs=args.epochs,
-        logger_kwargs=logger_kwargs)
+    return gradient_history
